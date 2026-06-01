@@ -8,20 +8,12 @@ Fork this repo, implement `decide()` in `agent.py`, push to a public GitHub repo
 
 ## 30-second start
 
-```bash
-git clone <this-repo>
-cd builderr-trading-template
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e /path/to/builderr   # private beta
-export BUILDERR_POLYGON_KEY=your-key
+1. **Fork this repo** on GitHub.
+2. **Implement `decide()`** in `agent.py`. The full contract is in the docstring + the [&laquo;The contract&raquo;](#the-contract) section below. Look at `baseline.py` and `soham_agent_v2.py` for two real reference implementations (the latter passes Phase A end-to-end).
+3. **Push to a public GitHub repo.**
+4. **Email the repo URL** to `writetosoham87@gmail.com` (see [&laquo;Submission&raquo;](#submission)). We run Phase A on our infrastructure within 24h and email you the score.
 
-# Run baseline to see the runner work
-python local_test.py baseline.py
-
-# Now build your own agent
-# (edit agent.py)
-python local_test.py
-```
+> **Local testing (optional, v0):** the `local_test.py` / `full_test.py` scripts depend on the private builderr engine. They're committed for reference (so you can read how scoring is done) but won&apos;t run from a fresh clone. The full builderr engine + cached market data are managed centrally; we run all Phase A evals to keep fills + cost caps identical across submissions. If you want to dry-run logic locally before submitting, write small unit tests against `decide()` directly.
 
 ---
 
