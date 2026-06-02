@@ -41,6 +41,7 @@ FIELD = [
     ("example_vol_target.py",        "vol-target",             "reference"),
     # Real Round 1 entrants (NOT house bots) — scored on the same live window.
     ("opu_agent.py",                 "opu",                    "round 1 · entrant"),
+    ("robert_agent.py",              "robert",                 "round 1 · entrant"),
 ]
 
 EVAL_DAYS = 60       # trailing trading-day window (matches the 60-day live horizon)

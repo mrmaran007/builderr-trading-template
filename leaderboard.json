@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-06-02T02:00:29Z",
+  "generated_at_utc": "2026-06-02T02:11:53Z",
   "as_of_market_date": "2026-06-01",
   "window_trading_days": 60,
   "note": "House/reference bots set the bar; Round 1 entrants are labeled as entrants. All scored on the same trailing 60 trading days of live market data, refreshed each market day. Ranked by Calmar.",
@@ -12,6 +12,15 @@
       "sharpe": 5.079,
       "calmar": 30.6864,
       "trades": 22
+    },
+    {
+      "name": "robert",
+      "label": "round 1 \u00b7 entrant",
+      "ret": 0.1653,
+      "mdd": 0.0342,
+      "sharpe": 4.8984,
+      "calmar": 26.3279,
+      "trades": 38
     },
     {
       "name": "vol-target",
