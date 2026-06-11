@@ -1,16 +1,21 @@
-"""Adaptive Calmar Shield v3 — Final (A+I + HALF_RISK cap).
+"""Adaptive Calmar Shield v3 — Rev 2 (dynamic HALF_RISK split + tighter CB).
 
 Objective: maximise 60-day forward Calmar (annualised return / max drawdown).
 
-Upgrades merged from competitive research (Sankeerth, Balaji, Ajai, Zaid):
-  1. Tight drawdown governor: 2% → HALF_RISK, 4% → DEFENSIVE
-  2. Maximum risk-on state is HALF_RISK (50/50 momentum/defensive) — FULL_RISK empirically loses on Calmar
-  3. QQQ realised-vol bands as VIX proxy for exposure scaling
-  4. TLT + GLD lead the defensive book (rise in crashes)
-  5. SPY single-day -2.5% circuit breaker → 3-day cooldown
-  6. Reduced turnover: 2.5% min trade, 7-day rebalance
-  7. Sector breadth (11 ETFs vs 50d SMA) as regime signal
-  8. Portfolio-level vol targeting at 18%
+Revision 2 changes (Jun 2026):
+  1. Dynamic HALF_RISK split: momentum budget = 0.50 * (1 - dd/0.04),
+     gliding 50/50 → 25/75 at 2% DD → 0/100 at 4% DD (converges with DD_FULL governor)
+  2. HARD_CAP checked before vol-scale so cash-out is final word (ordering fix)
+
+Baseline (rev 1, merged from competitive research — Sankeerth, Balaji, Ajai, Zaid):
+  - Tight drawdown governor: 2% → HALF_RISK, 4% → DEFENSIVE
+  - Maximum risk-on state is HALF_RISK (50/50 momentum/defensive) — FULL_RISK empirically loses on Calmar
+  - QQQ realised-vol bands as VIX proxy for exposure scaling
+  - TLT + GLD lead the defensive book (rise in crashes)
+  - SPY single-day -2.5% circuit breaker → 3-day cooldown
+  - Reduced turnover: 2.5% min trade, 7-day rebalance
+  - Sector breadth (11 ETFs vs 50d SMA) as regime signal
+  - Portfolio-level vol targeting at 18%
 """
 from __future__ import annotations
 
@@ -334,7 +339,7 @@ def _score(t: str, ms: dict[str, list[dict[str, Any]]]) -> float | None:
 
 # ── Weight construction ───────────────────────────────────────────────
 
-def _targets(ms: dict[str, list[dict[str, Any]]], reg: str) -> dict[str, float]:
+def _targets(ms: dict[str, list[dict[str, Any]]], reg: str, dd: float = 0.0) -> dict[str, float]:
     spy = _closes(ms.get("SPY"))
     if len(spy) < 50:
         return {}
@@ -349,11 +354,12 @@ def _targets(ms: dict[str, list[dict[str, Any]]], reg: str) -> dict[str, float]:
     scored.sort(reverse=True)
 
     if reg == "HALF_RISK":
-        mom_w = _inv_vol_weights(scored, ms, 4, 0.50)
+        mom_frac = 0.50 * max(0.0, 1.0 - dd / (2.0 * DD_HALF))
+        mom_w = _inv_vol_weights(scored, ms, 4, mom_frac)
         def_w = _defensive_weights(ms)
         total_def = sum(def_w.values()) or 1
         for t, w in def_w.items():
-            mom_w[t] = mom_w.get(t, 0) + w / total_def * 0.50
+            mom_w[t] = mom_w.get(t, 0) + w / total_def * (1.0 - mom_frac)
         return _cap(_port_vol_scale(mom_w, ms))
 
     return {}
@@ -416,7 +422,7 @@ def target_weights(ms):
     spy = _closes(ms.get("SPY"))
     spy50 = _sma(spy, 50) if len(spy) >= 50 else None
     risk_on = bool(spy50 is not None and spy[-1] > spy50)
-    return _targets(ms, "HALF_RISK" if risk_on else "DEFENSIVE")
+    return _targets(ms, "HALF_RISK" if risk_on else "DEFENSIVE", dd=0.0)
 
 # ── Entry point ───────────────────────────────────────────────────────
 
@@ -469,7 +475,7 @@ def decide(
     if not should:
         return []
 
-    tgts = _targets(market_state, reg)
+    tgts = _targets(market_state, reg, dd)
 
     if not tgts:
         pos = _positions(portfolio_state)
@@ -483,16 +489,15 @@ def decide(
         _last_regime = reg
         return liq[:45]
 
-    # Apply vol exposure scale to all weights
+    # I: Hard DD cap — override to defensive if drawdown exceeds 8%
+    #     Must run BEFORE vol-scale so cash-out (vol_scale=0) is final word.
+    if dd >= HARD_CAP:
+        tgts = _cap(_defensive_weights(market_state))
+
+    # Apply vol exposure scale to all weights (last word on positioning)
     if vol_scale < 1.0:
         tgts = {t: w * vol_scale for t, w in tgts.items()}
         tgts = _cap(tgts)
-
-    # I: Hard DD cap — redundant safety net behind the 4% governor
-    #     DD_FULL (0.04) already forces DEFENSIVE before HARD_CAP (0.08)
-    #     is ever reached. Retained as belt-and-suspenders only.
-    if dd >= HARD_CAP:
-        tgts = _cap(_defensive_weights(market_state))
 
     px = _prices(market_state)
     pos = _positions(portfolio_state)
