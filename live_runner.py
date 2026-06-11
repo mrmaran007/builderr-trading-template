@@ -244,6 +244,7 @@ def run_bot(decide, bars: dict[str, list[dict]]) -> dict:
         "pnl": round(equity - START_CASH, 2),
         "ret": equity / START_CASH - 1,
         "trades": trades,
+        "curve": [round(x, 2) for x in curve],  # daily mark-to-close equity, aligned to eval_dates
     }
 
 
@@ -274,6 +275,7 @@ def main() -> int:
         return 1
     asof = sorted({b["ts"] for rows in bars.values() for b in rows})[-1]
     rows = []
+    curves: dict[str, list] = {}   # name -> daily equity curve, for history.json (the race chart)
     for filename, name, label in FIELD:
         try:
             m = run_bot(load_decide(filename), bars)
@@ -283,6 +285,7 @@ def main() -> int:
         rows.append({"name": name, "label": label,
                      "equity": m["equity"], "pnl": m["pnl"],
                      "ret": round(m["ret"], 4), "trades": m["trades"]})
+        curves[name] = m["curve"]
         print(f"  {name:24s} ${m['equity']:,.0f}  P&L {m['pnl']:+,.0f} ({m['ret']*100:+.2f}%)  Trades={m['trades']}")
 
     # Private entrants: score locally if their (gitignored) code is present;
@@ -322,6 +325,48 @@ def main() -> int:
     }
     OUT.write_text(json.dumps(payload, indent=2))
     print(f"wrote {OUT} ({len(rows)} bots, as of {asof})")
+
+    # ---- history.json — per-day equity curves for the "strategy race" chart ----
+    # The board is a single snapshot; this is the time series behind it. We publish
+    # the market line + a few archetype-representative strategy curves (anonymized,
+    # grouped by style) + the rest of the field as faint context. Honest framing:
+    # each curve is the strategy's CURRENT version replayed over the round on real
+    # daily bars (no lookahead) — not a frozen daily standing. Private entrants are
+    # excluded here (we publish only their numbers on the board, never a full curve).
+    eval_dates = [d for d in sorted({b["ts"] for rs in bars.values() for b in rs}) if d >= ROUND_START]
+    qbars = {b["ts"]: b for b in bars.get("QQQ", [])}
+    market: list[float] = []
+    if eval_dates and qbars:
+        base = qbars.get(eval_dates[0], {}).get("open") or next(iter(qbars.values()))["open"]
+        last = START_CASH
+        for d in eval_dates:
+            if d in qbars and base:
+                last = round(START_CASH * qbars[d]["close"] / base, 2)
+            market.append(last)
+    FEATURED = [  # one clean representative per archetype — names hidden, style shown
+        ("sumegh",                 "Concentrated bet (AI / chips)"),
+        ("mohit",                  "Leveraged momentum"),
+        ("dual-momentum-rotation", "Broad rotation"),
+        ("sankeerth",              "Defensive / regime-switching"),
+    ]
+    feat_names = {n for n, _ in FEATURED}
+    featured = [{"label": lbl, "curve": curves[n]} for n, lbl in FEATURED if curves.get(n)]
+    field = [c for n, c in curves.items() if n not in feat_names and c]
+    hist = {
+        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "as_of_market_date": asof,
+        "round_start": ROUND_START,
+        "start_cash": START_CASH,
+        "dates": eval_dates,
+        "market": {"label": "Nasdaq-100 (the market)", "curve": market},
+        "featured": featured,
+        "field": field,
+        "note": ("Each line is a strategy's current version replayed over the round on real "
+                 "daily bars, no peeking at the future. Names are hidden on purpose; lines are "
+                 "grouped by trading style. The board is the snapshot; this is the time series behind it."),
+    }
+    (HERE / "history.json").write_text(json.dumps(hist, indent=2))
+    print(f"wrote history.json ({len(featured)} featured + {len(field)} field, {len(eval_dates)} days)")
     return 0
 
 
