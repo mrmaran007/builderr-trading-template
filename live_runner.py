@@ -81,6 +81,8 @@ FIELD = [
     # eval (no network/key) — it cleanly falls back to pure-Python logic, which
     # is what we score. Told him.
     ("rohan_agent.py",               "rohan",                  "round 1 · entrant"),
+    ("dev_agent.py",                 "dev",                    "round 1 · entrant"),
+    ("deepika_agent.py",             "deepika",                "round 1 · entrant"),
 ]
 
 # Private entrants (read-only deploy-key path). Their CODE never enters this
