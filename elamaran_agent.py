@@ -41,8 +41,57 @@ DRIFT_LIMIT = 0.27
 MAX_BETA_GROSS = 1.35
 MIN_TRADE_PCT = 0.015
 
+# --- Drawdown-aware de-risking -------------------------------------------
+# The contest scores on 60-day forward Calmar (return / max drawdown), so
+# controlling drawdown is worth as much as generating return. Once the
+# portfolio itself is underwater vs. its own peak, gross exposure is trimmed
+# regardless of what the market signals say. This tapers linearly and never
+# goes fully to zero exposure.
+DRAWDOWN_TAPER_START = 0.05   # start trimming once 5% off peak equity
+DRAWDOWN_TAPER_FULL = 0.15    # fully tapered by 15% off peak
+DRAWDOWN_FLOOR_SCALE = 0.55   # never scale exposure below this
+
+# --- Diversification guard -------------------------------------------------
+# Prevents the top-5 momentum picker from handing back 5 correlated names
+# (e.g. five megacap tech names) which would understate real portfolio risk.
+BUCKETS = {
+    "SPY": "broad", "QQQ": "broad", "DIA": "broad", "IWM": "broad",
+    "XLK": "sector", "XLF": "sector", "XLE": "sector", "XLV": "sector",
+    "XLI": "sector", "XLY": "sector", "XLP": "sector", "XLU": "sector",
+    "XLRE": "sector", "XLC": "sector", "SMH": "sector",
+    "AAPL": "megacap", "MSFT": "megacap", "GOOGL": "megacap", "AMZN": "megacap",
+    "META": "megacap", "NVDA": "megacap", "TSLA": "megacap",
+}
+MAX_PER_BUCKET = 3
+
 _last_rebalance_bar_date: str | None = None
 _last_targets: dict[str, float] = {}
+_equity_peak: float | None = None
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _drawdown_scale(total_equity: float) -> float:
+    """Return a 0-1 multiplier that trims gross exposure as the portfolio's
+    own equity curve draws down from its running peak. This is independent
+    of the market-timing signal below and acts as a second, orthogonal line
+    of defense against large drawdowns."""
+    global _equity_peak
+    if total_equity <= 0:
+        return 1.0
+    if _equity_peak is None or total_equity > _equity_peak:
+        _equity_peak = total_equity
+        return 1.0
+    dd = (_equity_peak - total_equity) / _equity_peak
+    if dd <= DRAWDOWN_TAPER_START:
+        return 1.0
+    if dd >= DRAWDOWN_TAPER_FULL:
+        return DRAWDOWN_FLOOR_SCALE
+    span = DRAWDOWN_TAPER_FULL - DRAWDOWN_TAPER_START
+    frac = (dd - DRAWDOWN_TAPER_START) / span
+    return 1.0 - frac * (1.0 - DRAWDOWN_FLOOR_SCALE)
 
 
 def closes(bars: list[dict[str, Any]] | None) -> list[float]:
@@ -186,6 +235,19 @@ def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, f
     if not risk_on:
         return _scale_caps(_risk_off_targets(market_state))
 
+    # Conviction: how strongly the trend/vol gate is satisfied, not just
+    # whether it's satisfied. A market that just barely crossed its 50-day
+    # SMA gets a smaller risk-asset budget than one in a clean, low-vol
+    # uptrend, and the remainder is parked in the defensive sleeve instead
+    # of being thrown fully at momentum names. This smooths the transition
+    # in/out of risk-on regimes and reduces whipsaw-driven drawdown.
+    trend_strength = min(
+        _clamp((spy[-1] / spy_sma50 - 1.0) / 0.04, 0.0, 1.0),
+        _clamp((qqq[-1] / qqq_sma50 - 1.0) / 0.04, 0.0, 1.0),
+    )
+    vol_headroom = _clamp((0.35 - qqq_vol20) / 0.20, 0.0, 1.0)
+    conviction = 0.5 + 0.5 * min(trend_strength, vol_headroom)  # in [0.5, 1.0]
+
     scored: list[tuple[float, str]] = []
     for ticker in RISK_CANDIDATES:
         values = closes(market_state.get(ticker))
@@ -198,12 +260,31 @@ def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, f
         if mom60 is None or mom20 is None or trend50 is None or vol20 is None:
             continue
         trend_gap = values[-1] / trend50 - 1.0
-        score = (0.55 * mom60) + (0.25 * mom20) + (0.20 * trend_gap) - (0.15 * vol20)
+        raw_score = (0.55 * mom60) + (0.25 * mom20) + (0.20 * trend_gap)
+        # Divide by (1 + vol) rather than subtracting a flat vol penalty:
+        # this is a proper risk-adjustment (Sharpe-like) so a very high-vol
+        # name needs proportionally more raw momentum to rank highly,
+        # instead of a fixed haircut that a strong-enough trend can swamp.
+        score = raw_score / (1.0 + vol20)
         if score > 0.0:
             scored.append((score, ticker))
 
     scored.sort(reverse=True)
-    winners = [ticker for _, ticker in scored[:5]]
+
+    # Bucket-capped selection: walk the ranked list but skip a candidate if
+    # its bucket (broad / sector / megacap) is already at MAX_PER_BUCKET
+    # among the picks so far, so momentum can't hand back 5 correlated names.
+    winners: list[str] = []
+    bucket_counts: dict[str, int] = {}
+    for _, ticker in scored:
+        if len(winners) >= 5:
+            break
+        bucket = BUCKETS.get(ticker, "other")
+        if bucket_counts.get(bucket, 0) >= MAX_PER_BUCKET:
+            continue
+        winners.append(ticker)
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+
     if not winners:
         return _scale_caps(_risk_off_targets(market_state))
 
@@ -221,14 +302,29 @@ def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, f
     )
 
     weights: dict[str, float] = {}
-    base_budget = 0.76 if overlay_on else 0.92
-    per_winner = min(MAX_WEIGHT - 0.02, base_budget / len(winners))
-    for ticker in winners:
-        weights[ticker] = per_winner
+    base_budget = (0.76 if overlay_on else 0.92) * conviction
+    # Rank-weight instead of equal-weight: the strongest-scoring name gets
+    # meaningfully more capital than the fifth pick, rather than splitting
+    # the budget evenly across the whole shortlist.
+    n = len(winners)
+    rank_weights = [n - i for i in range(n)]  # e.g. [5,4,3,2,1] for n=5
+    rank_total = sum(rank_weights)
+    cap = MAX_WEIGHT - 0.02
+    for ticker, rw in zip(winners, rank_weights):
+        weights[ticker] = min(cap, base_budget * rw / rank_total)
 
     if overlay_on:
-        weights["QLD"] = 0.11
-        weights["SSO"] = 0.07
+        weights["QLD"] = weights.get("QLD", 0.0) + 0.11 * conviction
+        weights["SSO"] = weights.get("SSO", 0.0) + 0.07 * conviction
+
+    # Whatever conviction didn't allocate to risk assets goes to the
+    # defensive sleeve at a reduced size, instead of sitting fully in cash
+    # or fully in momentum names on a marginal signal.
+    leftover = 1.0 - conviction
+    if leftover > 0.001:
+        for ticker, w in DEFENSIVE_WEIGHTS:
+            if closes(market_state.get(ticker)):
+                weights[ticker] = weights.get(ticker, 0.0) + w * leftover * 0.8
 
     return _scale_caps(weights)
 
@@ -331,6 +427,10 @@ def decide(
     targets = target_weights(market_state)
     if not targets:
         return []
+
+    dd_scale = _drawdown_scale(total_equity)
+    if dd_scale < 1.0:
+        targets = {t: round(w * dd_scale, 6) for t, w in targets.items()}
 
     prices = _market_prices(market_state)
     positions = current_positions(portfolio_state)
